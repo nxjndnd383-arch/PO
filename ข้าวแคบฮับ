@@ -1,0 +1,573 @@
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local LocalPlayer = Players.LocalPlayer
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+-- ===== AutoCollect =====
+local AC_ENABLED = false
+local SCAN_TICK, MAX_DISTANCE, MAX_PER_PASS, PASSES_PER_TICK, PROMPT_COOLDOWN = 0.03, 100, 50, 3, 0.15
+local lastScan = 0
+local promptCooldown, cachedPrompts, farm = {}, {}, nil
+
+local function getMyFarm()
+    if farm and farm.Parent then return farm end
+    local f = Workspace:FindFirstChild("Farm")
+    if not f then return end
+    for _, fm in ipairs(f:GetChildren()) do
+        if fm:GetAttribute("OwnerId") == LocalPlayer.UserId then
+            farm = fm
+            return fm
+        end
+    end
+end
+
+local function getPos()
+    local h = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    return h and h.Position
+end
+
+local function firePrompt(prompt)
+    if not prompt or not prompt.Parent or not prompt.Enabled then return false end
+    local now = os.clock()
+    local last = promptCooldown[prompt]
+    if last and (now - last) < PROMPT_COOLDOWN then return false end
+    promptCooldown[prompt] = now
+    pcall(function()
+        local orig = prompt.HoldDuration
+        prompt.HoldDuration = 0
+        prompt:InputHoldBegin()
+        prompt:InputHoldEnd()
+        prompt.HoldDuration = orig
+    end)
+    return true
+end
+
+local function addPrompt(prompt)
+    local part = prompt.Parent
+    if part and part:IsA("BasePart") then
+        table.insert(cachedPrompts, { prompt = prompt, part = part })
+    end
+end
+
+local function rebuildCache()
+    cachedPrompts = {}
+    local f = getMyFarm()
+    if not f then return end
+    for _, obj in ipairs(f:GetDescendants()) do
+        if obj:IsA("ProximityPrompt") and obj.Name == "ProductPrompt" then
+            addPrompt(obj)
+        end
+    end
+end
+
+local function onePass(pos)
+    local count = 0
+    for i = 1, #cachedPrompts do
+        local e = cachedPrompts[i]
+        local prompt, part = e.prompt, e.part
+        if prompt.Parent and prompt.Enabled and part.Parent then
+            local dx, dy, dz = part.Position.X - pos.X, part.Position.Y - pos.Y, part.Position.Z - pos.Z
+            if (dx*dx + dy*dy + dz*dz) <= MAX_DISTANCE * MAX_DISTANCE and firePrompt(prompt) then
+                count = count + 1
+                if count >= MAX_PER_PASS then break end
+            end
+        end
+    end
+    return count
+end
+
+local function burstScan()
+    if not AC_ENABLED then return end
+    local pos = getPos()
+    if not pos then return end
+    for _ = 1, PASSES_PER_TICK do
+        if onePass(pos) == 0 then break end
+    end
+    local now = os.clock()
+    for p, t in pairs(promptCooldown) do
+        if not p.Parent or (now - t) > 5 then promptCooldown[p] = nil end
+    end
+end
+
+local function hookFarm()
+    local f = getMyFarm()
+    if not f then return end
+    f.DescendantAdded:Connect(function(obj)
+        if obj:IsA("ProximityPrompt") and obj.Name == "ProductPrompt" then addPrompt(obj) end
+    end)
+    f.DescendantRemoving:Connect(function(obj)
+        if obj:IsA("ProximityPrompt") then
+            for i = #cachedPrompts, 1, -1 do
+                if cachedPrompts[i].prompt == obj then table.remove(cachedPrompts, i) end
+            end
+        end
+    end)
+end
+
+task.spawn(function()
+    while not getMyFarm() do task.wait(1) end
+    rebuildCache()
+    hookFarm()
+end)
+
+RunService.Heartbeat:Connect(function()
+    local now = os.clock()
+    if now - lastScan < SCAN_TICK then return end
+    lastScan = now
+    burstScan()
+end)
+
+-- ===== AutoClaim =====
+local AP_ENABLED = false
+local CLAIM_INTERVAL = 0.8
+local lastClaim = 0
+local RequestClaimProduction, FactoryConfig, FactoryCfg
+
+local function safeRequire(parent, name)
+    local mod = parent and parent:FindFirstChild(name)
+    if not mod then return nil end
+    local ok, result = pcall(function() return require(mod) end)
+    if ok then return result end
+end
+
+task.spawn(function()
+    local tries = 0
+    local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
+    while not Remotes and tries < 30 do
+        task.wait(1)
+        Remotes = ReplicatedStorage:FindFirstChild("Remotes")
+        tries = tries + 1
+    end
+    if not Remotes then return end
+
+    tries = 0
+    RequestClaimProduction = Remotes:FindFirstChild("RequestClaimProduction")
+    while not RequestClaimProduction and tries < 20 do
+        task.wait(0.5)
+        RequestClaimProduction = Remotes:FindFirstChild("RequestClaimProduction")
+        tries = tries + 1
+    end
+    if not RequestClaimProduction then return end
+
+    local Modules = ReplicatedStorage:WaitForChild("Modules", 20)
+    FactoryConfig = safeRequire(Modules, "FactoryConfig")
+    FactoryCfg = FactoryConfig and FactoryConfig.Config
+end)
+
+local function safeJsonDecode(str, default)
+    if type(str) ~= "string" or str == "" then return default or {} end
+    local ok, data = pcall(function() return HttpService:JSONDecode(str) end)
+    if ok and type(data) == "table" then return data end
+    return default or {}
+end
+
+local function getQueueJSON()
+    return safeJsonDecode(LocalPlayer:GetAttribute("FactoryQueue_JSON"), {})
+end
+
+local function getUnlockedFactories()
+    return safeJsonDecode(LocalPlayer:GetAttribute("UnlockedFactories_JSON"), {})
+end
+
+local function hasReadyToClaim(factoryName)
+    local data = getQueueJSON()[factoryName]
+    if not data then return false end
+    local now = Workspace:GetServerTimeNow()
+    local list = data.Q or data
+
+    for _, item in ipairs(list) do
+        if type(item) == "table" and now >= (item.EndTime or 0) then
+            return true
+        end
+    end
+    if data.R then
+        if type(data.R) == "table" then
+            for _, v in pairs(data.R) do
+                if tonumber(v) and tonumber(v) > 0 then return true end
+            end
+        elseif tonumber(data.R) and tonumber(data.R) > 0 then
+            return true
+        end
+    end
+    if data.B then
+        for _, v in pairs(data.B) do
+            if tonumber(v) and tonumber(v) > 0 then return true end
+        end
+    end
+    return false
+end
+
+local function autoClaim()
+    if not AP_ENABLED or not RequestClaimProduction or not FactoryCfg then return end
+    if os.clock() - lastClaim < CLAIM_INTERVAL then return end
+    lastClaim = os.clock()
+
+    local unlocked = getUnlockedFactories()
+    for factoryName in pairs(unlocked) do
+        if FactoryCfg[factoryName] and hasReadyToClaim(factoryName) then
+            pcall(function()
+                RequestClaimProduction:InvokeServer(factoryName)
+            end)
+            task.wait(0.3)
+        end
+    end
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        pcall(autoClaim)
+    end
+end)
+
+-- ===== AutoSell (จากโค้ดที่ให้มา) =====
+local AS_ENABLED = false
+local SELL_INTERVAL = 2
+local RequestSendDelivery
+
+task.spawn(function()
+    local tries = 0
+    RequestSendDelivery = ReplicatedStorage:FindFirstChild("RequestSendDelivery")
+    while not RequestSendDelivery and tries < 20 do
+        task.wait(0.5)
+        RequestSendDelivery = ReplicatedStorage:FindFirstChild("RequestSendDelivery")
+        tries = tries + 1
+    end
+end)
+
+task.spawn(function()
+    while true do
+        task.wait(SELL_INTERVAL)
+
+        if not AS_ENABLED then continue end
+        if not RequestSendDelivery then continue end
+
+        if LocalPlayer:GetAttribute("DataLoadedSuccessfully") ~= true then
+            continue
+        end
+        if LocalPlayer:GetAttribute("IsDelivering") == true then
+            continue
+        end
+
+        local invJSON = LocalPlayer:GetAttribute("Inventory_JSON") or "{}"
+        local ok, inv = pcall(HttpService.JSONDecode, HttpService, invJSON)
+        if not ok or type(inv) ~= "table" then
+            continue
+        end
+
+        local cart = {}
+        local hasItem = false
+        for name, count in pairs(inv) do
+            local c = tonumber(count) or 0
+            if c > 0 then
+                cart[name] = c
+                hasItem = true
+            end
+        end
+        if not hasItem then
+            continue
+        end
+
+        local success, result = pcall(function()
+            return RequestSendDelivery:InvokeServer(cart)
+        end)
+        if success and result then
+            print("[AutoSell] ส่งสำเร็จ")
+        else
+            warn("[AutoSell] ส่งไม่สำเร็จ:", result)
+        end
+    end
+end)
+
+-- ===== TP =====
+local FACTORY_NAMES = {
+    { name = "FlourFactory",    label = "🌾โรงงานแป้ง" },
+    { name = "BreadFactory",    label = "🥖โรงงานขนมปัง" },
+    { name = "YarnFactory",     label = "🧵โรงงานเส้นด้าย" },
+    { name = "SweaterFactory",  label = "👚โรงงานเสื้อกันหนาว" },
+    { name = "SausageFactory",  label = "🦬โรงงานไส้กรอก" },
+    { name = "HotdogFactory",   label = "🌭โรงงานฮอทดอก" },
+    { name = "ButterFactory",   label = "🧈โรงงานเนย" },
+    { name = "CheeseFactory",   label = "🧀โรงงานชีส" },
+}
+
+local function findFactoryPos(name)
+    local obj = Workspace:FindFirstChild(name, true)
+    if obj then
+        if obj:IsA("BasePart") then return obj.Position end
+        if obj:IsA("Model") then
+            local primary = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
+            if primary then return primary.Position end
+        end
+    end
+end
+
+local function teleportTo(name, label)
+    local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        warn("[TP] ❌ ไม่พบตัวละคร")
+        return
+    end
+    local pos = findFactoryPos(name)
+    if not pos then
+        warn("[TP] ❌ ไม่พบตำแหน่ง: " .. name)
+        return
+    end
+    hrp.CFrame = CFrame.new(pos + Vector3.new(0, 5, 0))
+    pcall(function()
+        ReplicatedStorage.Remotes.GlobalNotification:Fire("🌀 วาปไป " .. label, "Sukses")
+    end)
+end
+
+-- ===== GUI =====
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "Runaye"
+screenGui.ResetOnSpawn = false
+screenGui.IgnoreGuiInset = true
+screenGui.Parent = playerGui
+
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size = UDim2.new(0, 50, 0, 50)
+toggleBtn.Position = UDim2.new(0, 10, 0, 10)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(255, 105, 180)
+toggleBtn.Text = "🌸"
+toggleBtn.TextColor3 = Color3.new(1, 1, 1)
+toggleBtn.TextSize = 24
+toggleBtn.Font = Enum.Font.SourceSansBold
+toggleBtn.Parent = screenGui
+Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(1, 0)
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 250, 0, 200)
+mainFrame.Position = UDim2.new(0.5, -150, 0.5, -190)
+mainFrame.BackgroundColor3 = Color3.fromRGB(255, 240, 245)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Visible = false
+mainFrame.Parent = screenGui
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 20)
+
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 35)
+titleBar.BackgroundColor3 = Color3.fromRGB(255, 182, 193)
+titleBar.BorderSizePixel = 0
+titleBar.Parent = mainFrame
+Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 20)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -40, 1, 0)
+title.Position = UDim2.new(0, 10, 0, 0)
+title.BackgroundTransparency = 1
+title.Text = "🌸 ข้าวแคบ 🌸"
+title.TextColor3 = Color3.fromRGB(199, 21, 133)
+title.TextSize = 18
+title.Font = Enum.Font.FredokaOne
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = titleBar
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 28, 0, 28)
+closeBtn.Position = UDim2.new(1, -33, 0, 3)
+closeBtn.BackgroundColor3 = Color3.fromRGB(255, 105, 180)
+closeBtn.Text = "✿"
+closeBtn.TextColor3 = Color3.new(1, 1, 1)
+closeBtn.TextSize = 14
+closeBtn.Font = Enum.Font.SourceSansBold
+closeBtn.Parent = titleBar
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(1, 0)
+
+-- ===== Tab Bar =====
+local tabBar = Instance.new("Frame")
+tabBar.Size = UDim2.new(1, -20, 0, 35)
+tabBar.Position = UDim2.new(0, 10, 0, 42)
+tabBar.BackgroundColor3 = Color3.fromRGB(255, 228, 236)
+tabBar.BorderSizePixel = 0
+tabBar.Parent = mainFrame
+Instance.new("UICorner", tabBar).CornerRadius = UDim.new(1, 0)
+
+local tabLayout = Instance.new("UIListLayout")
+tabLayout.FillDirection = Enum.FillDirection.Horizontal
+tabLayout.Padding = UDim.new(0, 4)
+tabLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+tabLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+tabLayout.Parent = tabBar
+
+local content = Instance.new("Frame")
+content.Size = UDim2.new(1, -20, 1, -90)
+content.Position = UDim2.new(0, 10, 0, 82)
+content.BackgroundTransparency = 1
+content.ClipsDescendants = true
+content.Parent = mainFrame
+
+local tabNames = {"Auto", "TP"}
+local tabButtons, pages, currentTab = {}, {}, nil
+
+local function createPage(name)
+    local page = Instance.new("ScrollingFrame")
+    page.Name = name
+    page.Size = UDim2.new(1, 0, 1, 0)
+    page.BackgroundTransparency = 1
+    page.BorderSizePixel = 0
+    page.CanvasSize = UDim2.new(0, 0, 0, 0)
+    page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    page.ScrollBarThickness = 4
+    page.ScrollBarImageColor3 = Color3.fromRGB(0, 120, 255)
+    page.Visible = false
+    page.Parent = content
+    local layout = Instance.new("UIListLayout", page)
+    layout.Padding = UDim.new(0, 8)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    local pad = Instance.new("UIPadding", page)
+    pad.PaddingTop = UDim.new(0, 4)
+    pad.PaddingLeft = UDim.new(0, 4)
+    pad.PaddingRight = UDim.new(0, 4)
+    return page
+end
+
+local function switchTab(name)
+    if currentTab == name then return end
+    currentTab = name
+    for n, p in pairs(pages) do p.Visible = (n == name) end
+    for n, btn in pairs(tabButtons) do
+        local active = (n == name)
+        btn.BackgroundColor3 = active and Color3.fromRGB(0, 120, 255) or Color3.fromRGB(60, 60, 60)
+        btn.TextColor3 = active and Color3.new(1, 1, 1) or Color3.fromRGB(200, 200, 200)
+    end
+end
+
+for _, name in ipairs(tabNames) do
+    pages[name] = createPage(name)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 80, 0, 26)
+    btn.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
+    btn.Text = name
+    btn.TextColor3 = Color3.fromRGB(200, 200, 200)
+    btn.TextSize = 12
+    btn.Font = Enum.Font.SourceSansBold
+    btn.Parent = tabBar
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    btn.MouseButton1Click:Connect(function() switchTab(name) end)
+    tabButtons[name] = btn
+end
+
+local function createToggle(parent, text, defaultValue, callback)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, 0, 0, 40)
+    frame.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+    frame.BorderSizePixel = 0
+    frame.Parent = parent
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -70, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = text
+    label.TextColor3 = Color3.new(1, 1, 1)
+    label.TextSize = 13
+    label.Font = Enum.Font.SourceSans
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = frame
+
+    local switch = Instance.new("TextButton")
+    switch.Size = UDim2.new(0, 50, 0, 24)
+    switch.Position = UDim2.new(1, -60, 0.5, -12)
+    switch.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+    switch.Text = ""
+    switch.AutoButtonColor = false
+    switch.Parent = frame
+    Instance.new("UICorner", switch).CornerRadius = UDim.new(1, 0)
+
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.new(0, 20, 0, 20)
+    knob.Position = UDim2.new(0, 2, 0.5, -10)
+    knob.BackgroundColor3 = Color3.new(1, 1, 1)
+    knob.Parent = switch
+    Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+    local state = defaultValue or false
+    local function update()
+        switch.BackgroundColor3 = state and Color3.fromRGB(0, 200, 100) or Color3.fromRGB(80, 80, 80)
+        knob.Position = state and UDim2.new(1, -22, 0.5, -10) or UDim2.new(0, 2, 0.5, -10)
+    end
+    update()
+
+    switch.MouseButton1Click:Connect(function()
+        state = not state
+        update()
+        if callback then callback(state) end
+    end)
+end
+
+local function createButton(parent, text, callback)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 0, 40)
+    btn.BackgroundColor3 = Color3.fromRGB(0, 120, 255)
+    btn.Text = text
+    btn.TextColor3 = Color3.new(1, 1, 1)
+    btn.TextSize = 14
+    btn.Font = Enum.Font.SourceSansBold
+    btn.Parent = parent
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+    btn.MouseButton1Click:Connect(function() if callback then callback() end end)
+end
+
+-- ===== แท็บ Auto =====
+createToggle(pages["Auto"], "🐣เก็บ Auto", false, function(state)
+    AC_ENABLED = state
+    if state then rebuildCache() end
+end)
+createToggle(pages["Auto"], " 💸ขาย Auto", false, function(state)
+    AS_ENABLED = state
+end)
+createToggle(pages["Auto"], " 🌬️เก็บผลิต Auto", false, function(state)
+    AP_ENABLED = state
+end)
+
+-- ===== แท็บ TP =====
+for _, f in ipairs(FACTORY_NAMES) do
+    createButton(pages["TP"], f.label, function()
+        teleportTo(f.name, f.label)
+    end)
+end
+
+switchTab("Auto")
+
+-- ===== ลากย้าย (PC + Mobile) =====
+local function makeDraggable(frame, dragHandle)
+    local dragging, dragStart, startPos
+    dragHandle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = frame.Position
+        end
+    end)
+    dragHandle.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            frame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+makeDraggable(mainFrame, titleBar)
+makeDraggable(toggleBtn, toggleBtn)
+
+toggleBtn.MouseButton1Click:Connect(function() mainFrame.Visible = not mainFrame.Visible end)
+closeBtn.MouseButton1Click:Connect(function() mainFrame.Visible = false end)
